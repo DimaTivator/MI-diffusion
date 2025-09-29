@@ -1,0 +1,3 @@
+[submodule "minde"]
+	path = minde
+	url = https://github.com/MustaphaBounoua/minde.git
