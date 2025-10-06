@@ -38,7 +38,7 @@ def estimate_MI_monte_carlo(
     return np.mean(I)
 
 
-def estimate_MI_steps(model_AB, model_A_B, X, dt=0.01, T=5, batch_size=100_000):
+def estimate_MI_steps(model_AB, model_A_B, X, dt=0.01, T=5, batch_size=100_000, device="cuda"):
 
     t_range = np.arange(2 * dt, T, step=dt)
     average_errors = []
@@ -56,8 +56,8 @@ def estimate_MI_steps(model_AB, model_A_B, X, dt=0.01, T=5, batch_size=100_000):
 
         t = t * torch.ones((batch_size, 1))
 
-        score_AB = score_func(model_AB, X_t, t).cpu()
-        score_A_B = score_func(model_A_B, X_t, t).cpu()
+        score_AB = score_func(model_AB, X_t, t, device).cpu()
+        score_A_B = score_func(model_A_B, X_t, t, device).cpu()
 
         squared_error += torch.square(score_AB - score_A_B).sum()
 

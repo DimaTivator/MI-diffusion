@@ -1,5 +1,6 @@
 import torch
 from tqdm import tqdm, trange
+from IPython.display import clear_output
 
 
 class Diffusion(torch.nn.Module):
@@ -109,6 +110,7 @@ def train(model, optimizer, train_dataloader, n_epochs, device="cuda"):
 
         losses.append(sum_loss / len(train_dataloader))
 
+        clear_output(wait=True)
         tqdm.write(
             f"Epoch [{epoch+1}/{n_epochs}], Step [{step}/{len(train_dataloader)}], Loss: {loss.item():.4f}"
         )
