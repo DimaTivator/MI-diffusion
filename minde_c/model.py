@@ -7,51 +7,42 @@ from IPython.display import clear_output
 class Diffusion(torch.nn.Module):
     def __init__(self, denoiser, loss=None, T=5):
         super().__init__()
-
+        
         self.denoiser = denoiser
         self.loss = loss
         self.T = T
-
+        
         if self.loss is None:
             self.loss = torch.nn.MSELoss()
 
-    def apply_noise(
-        self, x: torch.Tensor, z: torch.Tensor, p: torch.Tensor
-    ) -> torch.Tensor:
+    def apply_noise(self, x: torch.Tensor, z: torch.Tensor, p: torch.Tensor) -> torch.Tensor:
         p = p.reshape((p.shape[0],) + (1,) * (len(x.shape) - 1))
         return p * x + torch.sqrt(1.0 - p**2) * z
 
-    def get_denoising_loss(self, x: torch.Tensor) -> torch.Tensor:
-        batch_size = x.shape[0]
-
-        t = torch.rand((batch_size,), device=x.device) * self.T
+    def get_denoising_loss(self, A: torch.Tensor, B: torch.Tensor) -> torch.Tensor: 
+        batch_size = A.shape[0]
+        
+        t = torch.rand((batch_size,), device=A.device) * self.T
         p = torch.exp(-t)
         # p = torch.sqrt(1.0 - torch.rand((batch_size,), device=x.device)**2.0)
-
-        z = torch.randn((x.shape[0], x.shape[1] // 2), device=x.device)
-
+        
+        z = torch.randn((A.shape[0], A.shape[1]), device=A.device)
+        
         # c == 0 -- marginal
-        # c == 1 -- conditional
+        # c == 1 -- conditional 
         cond = int(np.random.random() > 0.5)
-        half = x.shape[1] // 2
-        c = cond * torch.ones((batch_size,), device=x.device)
+        c = cond * torch.ones((batch_size,), device=A.device)
 
-        x_noisy = self.apply_noise(x[:, :half], z, p)
-
+        x_noisy = self.apply_noise(A, z, p)
+        
         if cond == 0:
-            z_pred = self.denoiser(
-                torch.cat([x_noisy, torch.zeros_like(x_noisy).to(x.device)], dim=1),
-                p,
-                c,
-            )
+            z_pred = self.denoiser(torch.cat([x_noisy, torch.zeros_like(B).to(A.device)], dim=1), p, c)
         else:
-            z_pred = self.denoiser(torch.cat([x_noisy, x[:, half:]], dim=1), p, c)
+            z_pred = self.denoiser(torch.cat([x_noisy, B], dim=1), p, c)
 
         return self.loss(z_pred, z)
 
-    def sample(
-        self, z: torch.Tensor, p_schedule: torch.Tensor, c: torch.Tensor
-    ) -> torch.Tensor:
+    def sample(self, z: torch.Tensor, p_schedule: torch.Tensor, c: torch.Tensor) -> torch.Tensor:
         # \overline{\alpha}_t = p_t^2
         # \overline{\alpha}_t = \prod_{s=1}^t \alpha_s
         # \alpha_s = 1 - \beta_s
@@ -60,24 +51,20 @@ class Diffusion(torch.nn.Module):
         overline_alpha = p_schedule**2
         alpha = overline_alpha[1::] / overline_alpha[:-1:]
         beta = 1.0 - alpha
-        sigma = torch.sqrt(
-            beta * (1.0 - overline_alpha[:-1:]) / (1.0 - overline_alpha[1::])
-        )
+        sigma = torch.sqrt(beta * (1.0 - overline_alpha[:-1:]) / (1.0 - overline_alpha[1::]))
 
         x = z
 
         for step in range(1, p_schedule.shape[0]):
             z_pred = self.denoiser(x, p_schedule[-step].repeat(x.shape[0]), c)
-
-            x = (
-                x - z_pred * beta[-step] / torch.sqrt(1.0 - overline_alpha[-step])
-            ) / torch.sqrt(alpha[-step])
+            
+            x = (x - z_pred * beta[-step] / torch.sqrt(1.0 - overline_alpha[-step])) / torch.sqrt(alpha[-step])
             x += sigma[-step] * torch.randn(x.shape, device=x.device)
 
         return x
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.get_denoising_loss(x)
+    def forward(self, A: torch.Tensor, B: torch.Tensor) -> torch.Tensor:
+        return self.get_denoising_loss(A, B)
 
 
 class ConditionalMLPDenoiser(torch.nn.Module):
@@ -116,10 +103,13 @@ def train(model, optimizer, train_dataloader, n_epochs, device="cuda"):
         for batch in train_dataloader:
             if isinstance(batch, list):
                 batch = batch[0]
-
+                
+            A = batch['A'].to(device)
+            B = batch['B'].to(device)
+            
             optimizer.zero_grad()
 
-            loss = model(batch.to(device))
+            loss = model(A, B)
             loss.backward()
 
             optimizer.step()
