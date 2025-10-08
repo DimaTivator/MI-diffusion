@@ -1,7 +1,11 @@
 import torch
+import torch.nn as nn
+
 import numpy as np
 from tqdm import tqdm, trange
 from IPython.display import clear_output
+from functools import partial
+
 
 
 class Diffusion(torch.nn.Module):
@@ -92,6 +96,125 @@ class ConditionalMLPDenoiser(torch.nn.Module):
         x_p = torch.cat([x, p, c], dim=-1)
 
         return self.MLP(x_p)
+    
+    
+def exists(x):
+    return x is not None
+
+
+def default(val, d):
+    if exists(val):
+        return val
+    return d() if callable(d) else d
+
+
+class Block(nn.Module):
+    def __init__(self, dim, dim_out, groups=8, shift_scale=True):
+        super().__init__()
+        self.proj = nn.Linear(dim, dim_out)
+        self.act = nn.SiLU()
+        self.norm = nn.GroupNorm(groups, dim)
+        self.shift_scale = shift_scale
+    
+    def forward(self, x, t=None):
+        x = self.norm(x)
+        x = self.act(x)
+        x = self.proj(x)
+        if exists(t):
+            if self.shift_scale:
+                scale, shift = t
+                x = x * (scale.squeeze() + 1) + shift.squeeze()
+            else:
+                x = x + t
+        return x
+    
+    
+class ResnetBlock(nn.Module):
+    def __init__(self, dim, dim_out, *, time_emb_dim=None, groups=8, shift_scale=False):
+        super().__init__()
+        self.shift_scale = shift_scale
+        self.mlp = nn.Sequential(
+            nn.SiLU(),
+            nn.Linear(time_emb_dim, dim_out * 2 if shift_scale else dim_out)
+        ) if exists(time_emb_dim) else None
+        self.block1 = Block(dim, dim_out, groups=groups, shift_scale=shift_scale)
+        self.block2 = Block(dim_out, dim_out, groups=groups, shift_scale=shift_scale)
+        self.lin_layer = nn.Linear(dim, dim_out) if dim != dim_out else nn.Identity()
+    
+    def forward(self, x, time_emb=None):
+        scale_shift = None
+        if exists(self.mlp) and exists(time_emb):
+            time_emb = self.mlp(time_emb)
+            scale_shift = time_emb
+        h = self.block1(x, t=scale_shift)
+        h = self.block2(h)
+        return h + self.lin_layer(x)
+    
+    
+class ConditionalUnetMLP(nn.Module):
+    def __init__(
+        self,
+        data_dim: int,
+        output_dim: int,
+        hidden_dim: int = 256,
+        time_dim: int = 128,
+        dim_mults=(1, 1),
+        resnet_block_groups: int = 8,
+        add_dim: int = 2,  # corresponds to p and c
+    ):
+        super().__init__()
+        self.add_dim = add_dim
+        init_dim = default(hidden_dim, data_dim)
+        dims = [init_dim, *map(lambda m: init_dim * m, dim_mults)]
+        in_out = list(zip(dims[:-1], dims[1:]))
+        block_class = partial(ResnetBlock, groups=resnet_block_groups)
+        self.init_lin = nn.Linear(data_dim + add_dim, init_dim)
+        self.cond_mlp = nn.Sequential(
+            nn.Linear(add_dim, time_dim),
+            nn.GELU(),
+            nn.Linear(time_dim, time_dim)
+        )
+        self.downs = nn.ModuleList([])
+        self.ups = nn.ModuleList([])
+        for dim_in, dim_out in in_out:
+            self.downs.append(
+                nn.ModuleList([block_class(dim_in, dim_in, time_emb_dim=time_dim)])
+            )
+        mid_dim = dims[-1]
+        self.mid_block = block_class(mid_dim, mid_dim, time_emb_dim=time_dim)
+        for dim_in, dim_out in reversed(in_out):
+            self.ups.append(
+                nn.ModuleList([block_class(dim_out + dim_in, dim_out, time_emb_dim=time_dim)])
+            )
+        self.final_res_block = block_class(init_dim * 2, init_dim, time_emb_dim=time_dim)
+        self.final_norm = nn.GroupNorm(resnet_block_groups, init_dim)
+        self.final_act = nn.SiLU()
+        self.final_lin = nn.Linear(init_dim, output_dim)
+        # nn.init.zeros_(self.final_lin.weight)
+        # nn.init.zeros_(self.final_lin.bias)
+        
+    def forward(self, x: torch.Tensor, p: torch.Tensor, c: torch.Tensor) -> torch.Tensor:
+        p = p.reshape(p.shape[0], 1)
+        c = c.reshape(c.shape[0], 1)
+        cond = torch.cat([p, c], dim=1)
+        x_input = torch.cat([x, cond], dim=1)
+        x = self.init_lin(x_input)
+        t = self.cond_mlp(cond)
+        residual = x.clone()
+        hs = []
+        for (block,) in self.downs:
+            x = block(x, t)
+            hs.append(x)
+        x = self.mid_block(x, t)
+        for (block,) in self.ups:
+            x = torch.cat((x, hs.pop()), dim=1)
+            x = block(x, t)
+        x = torch.cat((x, residual), dim=1)
+        x = self.final_res_block(x, t)
+        x = self.final_norm(x)
+        x = self.final_act(x)
+        x = self.final_lin(x)
+        return x
 
 
 def train(model, optimizer, train_dataloader, n_epochs, device="cuda"):
